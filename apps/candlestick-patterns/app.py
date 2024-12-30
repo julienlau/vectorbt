@@ -6,6 +6,7 @@
 # Run this app with `python app.py` and
 # visit http://127.0.0.1:8050/ in your web browser.
 
+import time
 import dash
 import dash_table
 import dash_core_components as dcc
@@ -16,6 +17,8 @@ from flask_caching import Cache
 import plotly.graph_objects as go
 
 import os
+import getpass
+import glob
 import numpy as np
 import pandas as pd
 import json
@@ -33,6 +36,8 @@ from vectorbt.utils.config import merge_dicts
 from vectorbt.utils.colors import adjust_opacity
 from vectorbt.portfolio.enums import Direction, DirectionConflictMode
 from vectorbt.portfolio.base import Portfolio
+
+from jpp_market_data.dal import Dal
 
 USE_CACHING = os.environ.get(
     "USE_CACHING",
@@ -96,7 +101,7 @@ active_color = "#88ccee"
 # Defaults
 data_path = 'data/data.h5'
 default_metric = 'Total Return [%]'
-default_symbol = 'BTC-USD'
+default_symbol = 'MC:SBF:EUR'
 default_period = '1y'
 default_interval = '1d'
 default_date_range = [0, 1]
@@ -463,6 +468,10 @@ app.layout = html.Div(
                                     "Reset",
                                     id="reset_button"
                                 ),
+                                html.Button(
+                                    "CleanCache",
+                                    id="clean_button"
+                                ),
                                 html.Details(
                                     open=True,
                                     children=[
@@ -509,7 +518,20 @@ app.layout = html.Div(
                                                             value=default_interval,
                                                         ),
                                                     ]
-                                                )
+                                                ),
+                                                dbc.Col(
+                                                    children=[
+                                                        html.Label("Source:"),
+                                                        dcc.Dropdown(
+                                                            id="datasource",
+                                                            options=[{"value": 'yahoo', "label": 'yahoo'},
+                                                                     {"value": 'csv', "label": 'csv'},
+                                                                     {"value": 'csv_all', "label": 'csv_all'},
+                                                                     {"value": 'sql', "label": 'sql'}],
+                                                            value='csv',
+                                                        ),
+                                                    ]
+                                                ),
                                             ],
                                         ),
                                         html.Label("Filter period:"),
@@ -938,9 +960,29 @@ app.clientside_callback(
 )
 
 
+data_mode = 'sql'
+df_all_symbol = None
+sql_dal = None
+
+
 @cache.memoize()
 def fetch_data(symbol, period, interval, auto_adjust, back_adjust):
+    """Fetch OHLCV data from backend."""
+    global data_mode
+    print(f"fetch_data {symbol} {period} {interval}")
+    if data_mode == 'csv_all':
+        return fetch_data_csv_all(symbol, period, interval, auto_adjust, back_adjust)
+    elif data_mode == 'csv':
+        return fetch_data_csv(symbol, period, interval, auto_adjust, back_adjust)
+    elif data_mode == 'sql':
+        return fetch_data_sql(symbol, period, interval, auto_adjust, back_adjust)
+    return fetch_data_yf(symbol, period, interval, auto_adjust, back_adjust)
+
+
+@cache.memoize()
+def fetch_data_yf(symbol, period, interval, auto_adjust, back_adjust):
     """Fetch OHLCV data from Yahoo! Finance."""
+    print('call fetch_data_yf')
     return yf.Ticker(symbol).history(
         period=period,
         interval=interval,
@@ -948,6 +990,79 @@ def fetch_data(symbol, period, interval, auto_adjust, back_adjust):
         auto_adjust=auto_adjust,
         back_adjust=back_adjust
     )
+
+
+@cache.memoize()
+def fetch_data_csv(symbol, period, interval, auto_adjust, back_adjust, csvdir='~/trade/data/kaggle_allUS_daily_with_volume_yahoo/stocks'):
+    """Fetch OHLCV data from csv containing one symbols."""
+    csvfile = csvdir + '/' + symbol + '.csv'
+    _start = time.perf_counter()
+    print('call fetch_data_csv on file %s' % csvfile)
+    df = pd.read_csv(csvfile, parse_dates=['Date'], index_col='Date')
+    _duration = time.perf_counter() - _start
+    print('done with parsing in %r sec' % _duration)
+    return df
+
+
+@cache.memoize()
+def fetch_data_csv_all(symbol, period, interval, auto_adjust, back_adjust, csvfile='~/trade/data/test.csv'):
+    """Fetch OHLCV data from csv containing multiple symbols."""
+    global df_all_symbol
+    csvfile = '~/trade/data/test.csv'
+    print('call fetch_data_csv_all on file %s' % csvfile)
+    if df_all_symbol is None:
+        _start = time.perf_counter()
+        df_all_symbol = pd.read_csv(csvfile, parse_dates=['date'])
+        df_all_symbol = df_all_symbol.rename(
+            columns={"date": "Date", "open": "Open", "high": "High", "low": "Low", "close": "Close",
+                     "volume": "Volume"})
+        df_all_symbol['Date'] = df_all_symbol['Date'].map(
+            lambda t: pd.to_datetime(t.replace(tzinfo=None)).to_pydatetime())
+        df_all_symbol = df_all_symbol.set_index(pd.DatetimeIndex(df_all_symbol['Date']))
+        _duration = time.perf_counter() - _start
+        print('done with parsing in %r sec' % _duration)
+    res = df_all_symbol[df_all_symbol['symbol'] == symbol]
+    res = res.drop(['symbol'], axis=1)
+    return res
+
+
+@cache.memoize()
+def fetch_data_sql(symbol, period, interval, auto_adjust, back_adjust):
+    """Fetch OHLCV data from SQL."""
+    global sql_dal
+    if interval == '60m':
+        dbtableRead = 'stock_market.hour1'
+    elif interval == '1d':
+        dbtableRead = 'stock_market.day1'
+    else:
+        raise(ValueError(f"error unknown interval {interval}"))
+    if sql_dal is None:
+        print('Dal init')
+        user = getpass.getuser()
+        password = os.getenv('pg_password')
+        sql_dal = Dal.Instance()
+        sql_dal.init(user=user, password=password)
+    print('call fetch_data_sql %s @ %s ' % (dbtableRead, symbol))
+    res = sql_dal.get_one_symbol(dbtableRead, symbol)
+    print('fetch_data_sql return %s' % str(res.size))
+    res = res.rename(
+        columns={"date": "Date", "open": "Open", "high": "High", "low": "Low", "close": "Close",
+                 "volume": "Volume"})
+    return res
+
+
+@app.callback(
+    [Output('clean_button', 'children')],
+    [Input('clean_button', 'n_clicks')],
+    prevent_initial_call=True
+)
+def clean_cache(_):
+    """Clean all data in cache."""
+    print('call clean_cache')
+    files = glob.glob('data/*')
+    for f in files:
+        os.remove(f)
+    return
 
 
 @app.callback(
@@ -960,10 +1075,15 @@ def fetch_data(symbol, period, interval, auto_adjust, back_adjust):
 )
 def update_data(symbol, period, interval, yf_options):
     """Store data into a hidden DIV to avoid repeatedly calling Yahoo's API."""
+    print('call update_data')
     auto_adjust = 'auto_adjust' in yf_options
     back_adjust = 'back_adjust' in yf_options
+    _start = time.perf_counter()
     df = fetch_data(symbol, period, interval, auto_adjust, back_adjust)
-    return df.to_json(date_format='iso', orient='split'), df.index.tolist()
+    _duration = time.perf_counter() - _start
+    res = df.to_json(date_format='iso', orient='split'), df.index.tolist()
+    print('fetch data in %r sec' % _duration)
+    return res
 
 
 @app.callback(
@@ -1095,6 +1215,7 @@ def update_ohlcv(window_width, plot_type, df_json, date_range, entry_patterns, e
     """Update OHLCV graph.
 
     Also update probability settings, as they also depend upon conversion of patterns into signals."""
+    print('call update_ohlcv')
     df = pd.read_json(df_json, orient='split')
 
     # Filter by date
@@ -1217,6 +1338,7 @@ def simulate_portfolio(df, interval, date_range, selected_data, entry_patterns, 
                        entry_dates, exit_dates, fees, fixed_fees, slippage, direction, conflict_mode,
                        sim_options, n_random_strat, prob_options, entry_prob, exit_prob):
     """Simulate portfolio of the main strategy, buy & hold strategy, and a bunch of random strategies."""
+    print('call simulate_portfolio')
     # Filter by date
     df = df.iloc[date_range[0]:date_range[1] + 1]
 
@@ -1357,6 +1479,7 @@ def update_stats(window_width, subplots, df_json, symbol, interval, date_range, 
                  slippage, direction, conflict_mode, sim_options, n_random_strat, prob_options,
                  entry_prob, exit_prob, stats_options, _2, curr_metric):
     """Final stage where we calculate key performance metrics and compare strategies."""
+    print('call update_stats')
     df = pd.read_json(df_json, orient='split')
 
     # Simulate portfolio
@@ -1465,6 +1588,7 @@ def update_stats(window_width, subplots, df_json, symbol, interval, date_range, 
 )
 def update_metric_stats(window_width, stats_json, metric):
     """Once a new metric has been selected, plot its distribution."""
+    print('call update_metric_stats')
     stats_dict = json.loads(stats_json)
     height = int(9 / 21 * 2 / 3 * 2 / 3 * window_width)
     return dict(

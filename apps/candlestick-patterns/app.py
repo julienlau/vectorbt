@@ -37,7 +37,8 @@ from vectorbt.utils.colors import adjust_opacity
 from vectorbt.portfolio.enums import Direction, DirectionConflictMode
 from vectorbt.portfolio.base import Portfolio
 
-from dal_stock_sql.dal import Dal
+#from dal_stock_sql.dal import Dal
+from jpp_market_data.dal import Dal
 
 USE_CACHING = os.environ.get(
     "USE_CACHING",
@@ -1025,11 +1026,11 @@ def fetch_data_sql(symbol, period, interval, auto_adjust, back_adjust):
     """Fetch OHLCV data from SQL."""
     global sql_dal
     if interval == '60m':
-        dbtableRead = 'stock_market.ohlcv_hour1'
+        dbtableRead = 'stock_market.ohlcv_1_hour'
     elif interval == '15m':
-        dbtableRead = 'stock_market.ohlcv_minute15'
+        dbtableRead = 'stock_market.ohlcv_15_min'
     elif interval == '1d':
-        dbtableRead = 'stock_market.ohlcv_day1'
+        dbtableRead = 'stock_market.ohlcv_1_day'
     else:
         raise(ValueError(f"error unknown interval {interval}"))
     if sql_dal is None:
